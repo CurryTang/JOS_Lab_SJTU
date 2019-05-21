@@ -1,0 +1,116 @@
+## Question 1
+根据代码注释中的提示，在原来的boot过程中，这些具体的地址由linker给出，在Lab1中我们也看到过对应的配置文件；现在在这里AP的boot过程中，我们使用MPBOOTPHYS来计算一个符号在gdt中的具体位置，
+符号的具体位置(注意这时候AP还在实模式下，所以只能使用物理地址)。为了把它加载到我们想要的地址，我们就要使用这种方法,而不是让linker指定地址。
+
+## Question 2
+当一个interrupt发生的时候，会越过big kernel lock把trapframe相关的寄存器信息push到kernel stack上，这时候没有per-cpu stack就会出错了。
+
+## Question 3
+这是由于每一个environment在的kernel space都是相同的，自然这个e也是相同的
+
+## Question 4
+trap.c文件中的trap()函数有一行curenv->env_tf = *tf完成了上述的任务
+
+## Challenge
+选择Challenge scheduling policy
+在env.h的env struct里添加一个新的项priority
+然后添加一个新的systemcall sys_change_priority
+同时新建一个priority_fork() 能够修改进程的priority
+具体代码部分如下
+envid_t
+priority_fork(int pr)
+{
+	// LAB 4: Your code here.
+	extern void _pgfault_upcall (void);
+	set_pgfault_handler(pgfault);
+
+	envid_t childenv;
+	uintptr_t addr;
+	int res;
+	childenv = sys_exofork();
+	if (childenv < 0){
+		panic("Error when creating child env");
+	} else if (childenv == 0){
+		thisenv = &envs[ENVX(sys_getenvid())];
+		sys_change_priority(pr);
+		return 0;
+	}
+	for(addr = UTEXT; addr < USTACKTOP;addr += PGSIZE){
+		if((uvpd[PDX(addr)] & PTE_P) && ((uvpt[PGNUM(addr)] & (PTE_P | PTE_U)) == (PTE_P | PTE_U))){
+			duppage(childenv, PGNUM(addr));
+		}
+	}
+	res = sys_page_alloc(childenv, (void *)(UXSTACKTOP - PGSIZE), PTE_U | PTE_W | PTE_P);
+	if(res < 0){
+		panic("Error to allocate exception stack\n");
+	}
+	res = sys_env_set_pgfault_upcall(childenv, _pgfault_upcall);
+	if(res < 0){
+		panic("Error in setting pgfault upcall\n");
+	}
+	res = sys_env_set_status(childenv, ENV_RUNNABLE);
+	if(res < 0){
+		panic("Error in setting child process state");
+	}
+	return childenv;
+
+}
+
+void
+sched_yield(void)
+{
+	struct Env *idle;
+
+	// Implement simple round-robin scheduling.
+	//
+	// Search through 'envs' for an ENV_RUNNABLE environment in
+	// circular fashion starting just after the env this CPU was
+	// last running.  Switch to the first such environment found.
+	//
+	// If no envs are runnable, but the environment previously
+	// running on this CPU is still ENV_RUNNING, it's okay to
+	// choose that environment.
+	//
+	// Never choose an environment that's currently running on
+	// another CPU (env_status == ENV_RUNNING). If there are
+	// no runnable environments, simply drop through to the code
+	// below to halt the cpu.
+
+	// LAB 4: Your code here.
+	int i, cur=0;
+	struct Env* running_env = NULL;
+	if (curenv) cur=ENVX(curenv->env_id);
+	else cur = 0;
+	for (i = 0; i < NENV; ++i) {
+		int j = (cur+i) % NENV;
+		if (envs[j].env_status == ENV_RUNNABLE && (!running_env || envs[j].priority > running_env->priority)){
+			running_env = &envs[j];
+		}
+	}
+	if (curenv && curenv->env_status == ENV_RUNNING && ((running_env == NULL) || (running_env->priority > curenv->priority)))
+		env_run(curenv);
+	if (running_env){
+		env_run(running_env);
+	}
+	// sched_halt never returns
+	sched_halt();
+}
+然后修改了客户端的hello文件进行测试
+目测有三个进程进行调度
+void
+umain(int argc, char **argv)
+{
+	int i;
+	for (i = 1; i <= 3; ++i) {
+		int pid = priority_fork(i);
+		if (pid == 0) {
+			cprintf("child %x\n with priority %x\n", i, i);
+			int j;
+			for (j = 0; j < 3; ++j) {
+				cprintf("child %x\n with priority %x\n", i, i);
+				sys_yield();
+			}
+			break;
+		}
+	}
+}
